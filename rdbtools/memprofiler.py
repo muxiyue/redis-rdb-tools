@@ -25,9 +25,11 @@ class StatsAggregator(object):
         self.aggregates = {}
         self.scatters = {}
         self.histograms = {}
+        self.metadata = {}
 
     def next_record(self, record):
         self.add_aggregate('database_memory', record.database, record.bytes)
+        self.add_aggregate('database_memory', 'all', record.bytes)
         self.add_aggregate('type_memory', record.type, record.bytes)
         self.add_aggregate('encoding_memory', record.encoding, record.bytes)
         
@@ -47,7 +49,7 @@ class StatsAggregator(object):
             self.add_scatter('sortedset_memory_by_length', record.bytes, record.size)
         elif record.type == 'string':
             self.add_scatter('string_memory_by_length', record.bytes, record.size)
-        elif record.type == 'dict':
+        elif record.type in ['dict', 'module', 'stream']:
             pass
         else:
             raise Exception('Invalid data type %s' % record.type)
@@ -74,9 +76,12 @@ class StatsAggregator(object):
         if not heading in self.scatters:
             self.scatters[heading] = []
         self.scatters[heading].append([x, y])
+
+    def set_metadata(self, key, val):
+        self.metadata[key] = val
   
     def get_json(self):
-        return json.dumps({"aggregates":self.aggregates, "scatters":self.scatters, "histograms":self.histograms})
+        return json.dumps({"aggregates": self.aggregates, "scatters": self.scatters, "histograms": self.histograms, "metadata": self.metadata})
         
 class PrintAllKeys(object):
     def __init__(self, out, bytes, largest):
@@ -160,7 +165,6 @@ class MemoryCallback(RdbCallback):
         pass
 
     def aux_field(self, key, value):
-        #print('aux: %s %s' % (key, value))
         if key == 'used-mem':
             self._aux_used_mem = int(value)
         if key == 'redis-ver':
@@ -180,9 +184,13 @@ class MemoryCallback(RdbCallback):
             self._stream.end_database(db_number)
 
     def end_rdb(self):
-        #print('internal fragmentation: %s' % self._total_internal_frag)
         if hasattr(self._stream, 'end_rdb'):
             self._stream.end_rdb()
+        if hasattr(self._stream, 'set_metadata'):
+            self._stream.set_metadata('used_mem', self._aux_used_mem)
+            self._stream.set_metadata('redis_ver', self._aux_redis_ver)
+            self._stream.set_metadata('redis_bits', self._aux_redis_bits)
+            self._stream.set_metadata('internal_frag', self._total_internal_frag)
 
     def set(self, key, value, expiry, info):
         self._current_encoding = info['encoding']
@@ -244,8 +252,8 @@ class MemoryCallback(RdbCallback):
     
     def start_list(self, key, expiry, info):
         self._current_length = 0
-        self._list_items_size = 0
-        self._list_items_zipped_size = 0
+        self._list_items_size = 0  # size of all elements in case list ends up using linked list
+        self._list_items_zipped_size = 0  # size of all elements in case of ziplist of quicklist
         self._current_encoding = info['encoding']
         size = self.top_level_object_overhead(key, expiry)
         self._key_expiry = expiry
@@ -268,23 +276,26 @@ class MemoryCallback(RdbCallback):
             
     def rpush(self, key, value):
         self._current_length += 1
-        size = self.sizeof_string(value) if type(value) != int else 4
+        # in linked list, when the robj has integer encoding, the value consumes no memory on top of the robj
+        size_in_list = self.sizeof_string(value) if not self.is_integer_type(value) else 0
+        # in ziplist and quicklist, this is the size of the value and the value header
+        size_in_zip = self.ziplist_entry_overhead(value)
 
         if(self.element_length(value) > self._len_largest_element):
             self._len_largest_element = self.element_length(value)
 
         if self._current_encoding == "ziplist":
-            self._list_items_zipped_size += self.ziplist_entry_overhead(value)
-            if self._current_length > self._list_max_ziplist_entries or size > self._list_max_ziplist_value:
+            self._list_items_zipped_size += size_in_zip
+            if self._current_length > self._list_max_ziplist_entries or size_in_zip > self._list_max_ziplist_value:
                 self._current_encoding = "linkedlist"
         elif self._current_encoding == "quicklist":
-            if self._cur_zip_size + size > self._list_max_ziplist_size:
-                self._cur_zip_size = size
+            if self._cur_zip_size + size_in_zip > self._list_max_ziplist_size:
+                self._cur_zip_size = size_in_zip
                 self._cur_zips += 1
             else:
-                self._cur_zip_size += size
+                self._cur_zip_size += size_in_zip
             self._list_items_zipped_size += self.ziplist_entry_overhead(value)
-        self._list_items_size += size  # not to be used in case of ziplist or quicklist
+        self._list_items_size += size_in_list  # not to be used in case of ziplist or quicklist
 
     def end_list(self, key, info):
         if self._current_encoding == 'quicklist':
@@ -474,7 +485,7 @@ class MemoryCallback(RdbCallback):
 
     def ziplist_entry_overhead(self, value):
         # See https://github.com/antirez/redis/blob/unstable/src/ziplist.c
-        if type(value) == int:
+        if self.is_integer_type(value):
             header = 1
             if value < 12:
                 size = 0
@@ -540,12 +551,17 @@ class MemoryCallback(RdbCallback):
         else:
             return ZSKIPLIST_MAXLEVEL
 
-    def element_length(self, element):
-        if isinstance(element, int):
-            return self._long_size
+    def is_integer_type(self, ob):
+        if isinstance(ob, int):
+            return True
         if sys.version_info < (3,):
-            if isinstance(element, long):
-                return self._long_size
+            if isinstance(ob, long):
+                return True
+        return False
+
+    def element_length(self, element):
+        if self.is_integer_type(element):
+            return self._long_size
         return len(element)
 
 
